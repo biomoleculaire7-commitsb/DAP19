@@ -11,6 +11,8 @@ import {
 } from '../types/parasitology';
 import { translations } from '../translations';
 import { SAMPLE_SLIDES, PARASITE_SPECIES, USER_MODEL_CLASSES } from '../data/mockData';
+import { onnxEngine, ModelMetadata } from '../services/onnxInference';
+import { OnnxModelModal } from './OnnxModelModal';
 import { 
   Video, 
   UploadCloud, 
@@ -36,6 +38,8 @@ import {
   Layers,
   CheckCircle2,
   AlertTriangle,
+  AlertCircle,
+  X,
   FolderOpen
 } from 'lucide-react';
 
@@ -80,9 +84,17 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const modelFileInputRef = useRef<HTMLInputElement>(null);
 
-  // ONNX model status
-  const [uploadedModelName, setUploadedModelName] = useState<string | null>(null);
-  const [isModelLoaded, setIsModelLoaded] = useState<boolean>(false);
+  // ONNX model status & runtime state
+  const [uploadedModelName, setUploadedModelName] = useState<string | null>('exp.onnx');
+  const [isModelLoaded, setIsModelLoaded] = useState<boolean>(onnxEngine.isReady());
+  const [isOnnxModalOpen, setIsOnnxModalOpen] = useState<boolean>(false);
+  const [isInferenceRunning, setIsInferenceRunning] = useState<boolean>(false);
+  const [inferenceStatus, setInferenceStatus] = useState<{
+    type: 'info' | 'success' | 'warning' | 'error';
+    message: string;
+    duration?: number;
+  } | null>(null);
+  const activeImageRef = useRef<HTMLImageElement>(null);
 
   // Optical & display settings
   const [confidenceThreshold, setConfidenceThreshold] = useState(labConfig.confidenceThreshold || 0.85);
@@ -120,6 +132,27 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
       }
     }
     getDevices();
+  }, []);
+
+  // Try preloading exp.onnx on mount if hosted on server
+  useEffect(() => {
+    async function checkPreloadedModel() {
+      if (onnxEngine.isReady()) return;
+      try {
+        const meta = await onnxEngine.loadModel('/models/exp.onnx', 'exp.onnx');
+        setUploadedModelName(meta.name);
+        setIsModelLoaded(true);
+      } catch (e1) {
+        try {
+          const meta = await onnxEngine.loadModel('/exp.onnx', 'exp.onnx');
+          setUploadedModelName(meta.name);
+          setIsModelLoaded(true);
+        } catch (e2) {
+          // Model will be loaded by user via file picker
+        }
+      }
+    }
+    checkPreloadedModel();
   }, []);
 
   // Manage Camera Stream
@@ -239,13 +272,134 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
     }
   };
 
-  // Handle ONNX model file upload
-  const handleModelUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Handle ONNX model file upload directly or via modal
+  const handleModelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      setUploadedModelName(file.name);
-      setIsModelLoaded(true);
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith('.onnx')) {
+      if (file.name.toLowerCase().endsWith('.pt') || file.name.toLowerCase().endsWith('.pth')) {
+        setInferenceStatus({
+          type: 'error',
+          message:
+            'Format PyTorch (.pt) détecté ! Le navigateur requiert le format ONNX (.onnx). Ouvrez le gestionnaire de modèle pour les instructions d\'exportation en 1 ligne.',
+        });
+        setIsOnnxModalOpen(true);
+        return;
+      }
+      setInferenceStatus({
+        type: 'error',
+        message: 'Fichier invalide : veuillez sélectionner un modèle au format .onnx',
+      });
+      return;
     }
+
+    try {
+      setInferenceStatus({ type: 'info', message: `Chargement du modèle ${file.name} en WebAssembly...` });
+      const meta = await onnxEngine.loadModel(file);
+      setUploadedModelName(meta.name);
+      setIsModelLoaded(true);
+      setInferenceStatus({
+        type: 'success',
+        message: `Modèle ${meta.name} (${(meta.sizeBytes / 1024 / 1024).toFixed(1)} MB) chargé avec succès et prêt !`,
+      });
+    } catch (err: any) {
+      setInferenceStatus({
+        type: 'error',
+        message: `Échec du chargement : ${err?.message || 'Erreur interne WebAssembly'}`,
+      });
+    }
+  };
+
+  // Run real in-browser ONNX inference on active image
+  const handleRunInference = async () => {
+    if (!onnxEngine.isReady()) {
+      setIsOnnxModalOpen(true);
+      return;
+    }
+
+    if (!activeImageRef.current) {
+      setInferenceStatus({
+        type: 'warning',
+        message: 'Veuillez sélectionner ou capturer une image de microscope avant de lancer l\'inférence.',
+      });
+      return;
+    }
+
+    setIsInferenceRunning(true);
+    setInferenceStatus({
+      type: 'info',
+      message: 'Exécution du modèle ONNX (19 classes) en WebAssembly...',
+    });
+
+    try {
+      const result = await onnxEngine.runInference(activeImageRef.current, confidenceThreshold, 0.45);
+      
+      if (result.boxes.length > 0) {
+        setCustomDetections(result.boxes);
+        setInferenceStatus({
+          type: 'success',
+          message: `Inférence réussie en ${result.inferenceTimeMs} ms : ${result.boxes.length} élément(s) parasitaire(s) identifié(s).`,
+          duration: result.inferenceTimeMs,
+        });
+      } else {
+        setInferenceStatus({
+          type: 'warning',
+          message: `Inférence terminée (${result.inferenceTimeMs} ms) : aucun élément au seuil de ${Math.round(confidenceThreshold * 100)}%. Baissez le curseur de confiance ou testez une autre zone.`,
+          duration: result.inferenceTimeMs,
+        });
+      }
+    } catch (err: any) {
+      console.error('Inference error:', err);
+      setInferenceStatus({
+        type: 'error',
+        message: `Erreur d'inférence ONNX : ${err?.message || 'Incompatibilité de tenseur'}`,
+      });
+    } finally {
+      setIsInferenceRunning(false);
+    }
+  };
+
+  // Test simulation helper for all 19 parasites to verify MVP workflow
+  const handleRunSimulation = (speciesKey: string) => {
+    const cur = PARASITE_SPECIES[speciesKey] || PARASITE_SPECIES.hookworm;
+    const simBoxes: BoundingBox[] = [
+      {
+        id: `sim-box-${Date.now()}-1`,
+        classIndex: cur.classIndex,
+        speciesId: cur.id,
+        speciesName: cur.modelLabel,
+        speciesScientific: cur.scientificName,
+        stage: 'Diagnostic 19-Classes Simulé',
+        confidence: 0.962,
+        x: 36,
+        y: 32,
+        width: 26,
+        height: 32,
+        dimensionsUm: cur.typicalSize.split(' ')[0] || '60 x 45 µm',
+        color: cur.color,
+      },
+      {
+        id: `sim-box-${Date.now()}-2`,
+        classIndex: cur.classIndex,
+        speciesId: cur.id,
+        speciesName: cur.modelLabel,
+        speciesScientific: cur.scientificName,
+        stage: 'Diagnostic 19-Classes Simulé',
+        confidence: 0.915,
+        x: 64,
+        y: 55,
+        width: 22,
+        height: 28,
+        dimensionsUm: cur.typicalSize.split(' ')[0] || '58 x 42 µm',
+        color: cur.color,
+      },
+    ];
+    setCustomDetections(simBoxes);
+    setInferenceStatus({
+      type: 'success',
+      message: `Test simulé activé pour l'espèce [${cur.classIndex}: ${cur.modelLabel}]. Prêt pour génération de rapport médical !`,
+    });
   };
 
   // Add manual bounding box on click
@@ -411,28 +565,59 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
 
         </div>
 
-        {/* ONNX Model Status & 19-Parasite Badge */}
-        <div className="flex items-center gap-3 shrink-0">
+        {/* ONNX Model Status & 19-Parasite Execution Controls */}
+        <div className="flex items-center gap-2.5 shrink-0">
           
-          {/* ONNX 19 Parasite Badge */}
+          {/* Primary Action: Run ONNX Model Inference */}
           <button
-            onClick={() => modelFileInputRef.current?.click()}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-sky-950/80 border border-sky-800/80 text-[11px] text-sky-300 hover:bg-sky-900 transition-colors"
-            title="Importer modèle ONNX entraîné sur 19 espèces"
+            onClick={handleRunInference}
+            disabled={isInferenceRunning}
+            className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 text-xs transition-all ${
+              isInferenceRunning
+                ? 'bg-sky-700 text-white cursor-wait opacity-80'
+                : 'bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white shadow-md shadow-sky-950 ring-1 ring-sky-400'
+            }`}
+            title="Exécuter le modèle ONNX (19 classes) sur l'image affichée"
+          >
+            {isInferenceRunning ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin text-white" />
+            ) : (
+              <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+            )}
+            <span>{isInferenceRunning ? 'Inférence...' : '⚡ Lancer Inférence IA'}</span>
+          </button>
+
+          {/* ONNX Model Diagnostic / Settings Modal Trigger */}
+          <button
+            onClick={() => setIsOnnxModalOpen(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-200 hover:bg-slate-700 transition-colors"
+            title="Gérer le modèle ONNX (chargement, diagnostic, classes 0 à 18)"
           >
             <Cpu className="w-3.5 h-3.5 text-sky-400" />
-            <span className="font-mono font-semibold">19 Parasites ONNX Model</span>
+            <span className="font-mono">{uploadedModelName || 'Modèle 19 Parasites'}</span>
             {isModelLoaded ? (
-              <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-1 rounded">Actif</span>
+              <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-1 rounded font-bold">Actif</span>
             ) : (
-              <span className="text-[10px] text-sky-400/70 hover:underline">+ Charger .onnx</span>
+              <span className="text-[10px] bg-sky-500/20 text-sky-300 px-1 rounded">+ Configurer</span>
             )}
           </button>
+
+          {/* Quick Simulation Test Button */}
+          <button
+            onClick={() => handleRunSimulation(selectedSpeciesForManual)}
+            className="hidden sm:flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700/80 text-xs text-amber-300 hover:bg-slate-700 transition-colors"
+            title="Tester immédiatement l'espèce sélectionnée"
+          >
+            <Play className="w-3.5 h-3.5 text-amber-400" />
+            <span>Test Simulation</span>
+          </button>
+
+          {/* Hidden File Input for direct ONNX upload */}
           <input
             type="file"
             ref={modelFileInputRef}
             onChange={handleModelUpload}
-            accept=".onnx,.bin,.json"
+            accept=".onnx,.pt,.pth"
             className="hidden"
           />
 
@@ -454,6 +639,46 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
         </div>
 
       </div>
+
+      {/* Real-time Status / Diagnostic Banner */}
+      {inferenceStatus && (
+        <div
+          className={`px-4 py-2 flex items-center justify-between text-xs border-b shrink-0 animate-in fade-in transition-all ${
+            inferenceStatus.type === 'error'
+              ? 'bg-rose-950 text-rose-200 border-rose-800'
+              : inferenceStatus.type === 'warning'
+              ? 'bg-amber-950 text-amber-200 border-amber-800'
+              : inferenceStatus.type === 'success'
+              ? 'bg-emerald-950 text-emerald-200 border-emerald-800'
+              : 'bg-sky-950 text-sky-200 border-sky-800'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {inferenceStatus.type === 'error' && <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />}
+            {inferenceStatus.type === 'warning' && <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />}
+            {inferenceStatus.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />}
+            {inferenceStatus.type === 'info' && <RefreshCw className="w-4 h-4 text-sky-400 animate-spin shrink-0" />}
+            <span className="font-medium">{inferenceStatus.message}</span>
+          </div>
+          <div className="flex items-center gap-3">
+            {inferenceStatus.type === 'error' && (
+              <button
+                onClick={() => setIsOnnxModalOpen(true)}
+                className="underline font-bold text-sky-300 hover:text-white"
+              >
+                Résoudre / Guide d'Export
+              </button>
+            )}
+            <button
+              onClick={() => setInferenceStatus(null)}
+              className="p-1 hover:text-white rounded"
+              title="Fermer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* 2. Main Center Split: Viewport (Left) + Live Metrics Panel (Right) */}
       <div className="flex-1 flex flex-col lg:flex-row overflow-hidden relative">
@@ -530,12 +755,14 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
                 transition: 'transform 0.15s ease-out',
               }}
             >
-              {/* Image element */}
+              {/* Image element with DOM ref for tensor preprocessing */}
               <img
+                ref={activeImageRef}
                 src={activeImageSrc}
                 alt="Microscope field"
                 className="max-h-[70vh] w-auto object-contain block pointer-events-none"
                 referrerPolicy="no-referrer"
+                crossOrigin="anonymous"
               />
 
               {/* Micrometric Grid Reticle */}
@@ -1002,6 +1229,22 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
         </div>
 
       </div>
+
+      {/* ONNX Model Management & Diagnostic Modal */}
+      <OnnxModelModal
+        isOpen={isOnnxModalOpen}
+        onClose={() => setIsOnnxModalOpen(false)}
+        language={language}
+        onModelLoaded={(meta) => {
+          setIsModelLoaded(true);
+          setUploadedModelName(meta.name);
+          setInferenceStatus({
+            type: 'success',
+            message: `Modèle ${meta.name} prêt pour l'inférence. Cliquez sur "⚡ Lancer Inférence IA".`,
+          });
+        }}
+        onRunTestInference={handleRunInference}
+      />
 
     </div>
   );
