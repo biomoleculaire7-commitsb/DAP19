@@ -96,8 +96,8 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
   } | null>(null);
   const activeImageRef = useRef<HTMLImageElement>(null);
 
-  // Optical & display settings
-  const [confidenceThreshold, setConfidenceThreshold] = useState(labConfig.confidenceThreshold || 0.85);
+  // Optical & display settings (0.25 standard YOLO confidence threshold)
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0.25);
   const [showBoxes, setShowBoxes] = useState(true);
   const [showReticle, setShowReticle] = useState(false);
   const [showCrosshair, setShowCrosshair] = useState(false);
@@ -105,9 +105,7 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
   const [zoomLevel, setZoomLevel] = useState<number>(1);
   const [selectedBoxId, setSelectedBoxId] = useState<string | null>(null);
 
-  // 19 Parasites catalog modal / selection
-  const [activeCategoryFilter, setActiveCategoryFilter] = useState<string>('all');
-  const [isAnnotating, setIsAnnotating] = useState<boolean>(false);
+  // 19 Parasites catalog selection
   const [selectedSpeciesForManual, setSelectedSpeciesForManual] = useState<string>('ascaris');
 
   // Simulated live motion
@@ -215,27 +213,19 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
 
     setCustomImageSrc(dataUrl);
     setSourceType('captured_photo');
+    setCustomDetections([]); // strictly empty until ONNX runs
 
-    // Auto-generate AI detections on captured frame using the 19-parasite model
-    const currentSpecies = PARASITE_SPECIES[selectedSpeciesForManual] || PARASITE_SPECIES.hookworm;
-    const detectedSample: BoundingBox[] = [
-      {
-        id: `box-cap-${Date.now()}-1`,
-        classIndex: currentSpecies.classIndex,
-        speciesId: currentSpecies.id,
-        speciesName: currentSpecies.modelLabel,
-        speciesScientific: currentSpecies.scientificName,
-        stage: 'Clinical stage',
-        confidence: 0.952,
-        x: 38,
-        y: 35,
-        width: 24,
-        height: 28,
-        dimensionsUm: currentSpecies.typicalSize.split(' ')[0] || '60 x 45 µm',
-        color: currentSpecies.color,
-      },
-    ];
-    setCustomDetections(detectedSample);
+    if (onnxEngine.isReady()) {
+      setInferenceStatus({
+        type: 'info',
+        message: 'Photo capturée. Cliquez sur "⚡ Lancer Inférence IA" pour analyser avec exp.onnx.',
+      });
+    } else {
+      setInferenceStatus({
+        type: 'warning',
+        message: 'Photo capturée. Veuillez charger votre modèle exp.onnx pour lancer l\'analyse.',
+      });
+    }
   };
 
   // Handle local image file upload (from desktop / mobile)
@@ -247,26 +237,19 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
         const src = event.target?.result as string;
         setCustomImageSrc(src);
         setSourceType('custom_upload');
-        // Initial AI detection for uploaded image using selected parasite species
-        const cur = PARASITE_SPECIES[selectedSpeciesForManual] || PARASITE_SPECIES.hookworm;
-        const newDetections: BoundingBox[] = [
-          {
-            id: `box-up-${Date.now()}-1`,
-            classIndex: cur.classIndex,
-            speciesId: cur.id,
-            speciesName: cur.modelLabel,
-            speciesScientific: cur.scientificName,
-            stage: 'Detected parasitic element',
-            confidence: 0.945,
-            x: 40,
-            y: 34,
-            width: 22,
-            height: 28,
-            dimensionsUm: cur.typicalSize.split(' ')[0] || '55 x 35 µm',
-            color: cur.color,
-          },
-        ];
-        setCustomDetections(newDetections);
+        setCustomDetections([]); // strictly empty until ONNX runs
+
+        if (onnxEngine.isReady()) {
+          setInferenceStatus({
+            type: 'info',
+            message: `Image ${file.name} chargée. Prête pour l'inférence avec exp.onnx.`,
+          });
+        } else {
+          setInferenceStatus({
+            type: 'warning',
+            message: `Image ${file.name} chargée. Chargez exp.onnx pour détecter les parasites.`,
+          });
+        }
       };
       reader.readAsDataURL(file);
     }
@@ -282,14 +265,14 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
         setInferenceStatus({
           type: 'error',
           message:
-            'Format PyTorch (.pt) détecté ! Le navigateur requiert le format ONNX (.onnx). Ouvrez le gestionnaire de modèle pour les instructions d\'exportation en 1 ligne.',
+            'Format PyTorch (.pt) détecté ! Le navigateur requiert le format ONNX (.onnx). Veuillez exporter en ONNX.',
         });
         setIsOnnxModalOpen(true);
         return;
       }
       setInferenceStatus({
         type: 'error',
-        message: 'Fichier invalide : veuillez sélectionner un modèle au format .onnx',
+        message: 'Fichier invalide : veuillez sélectionner votre modèle au format .onnx (exp.onnx)',
       });
       return;
     }
@@ -301,7 +284,7 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
       setIsModelLoaded(true);
       setInferenceStatus({
         type: 'success',
-        message: `Modèle ${meta.name} (${(meta.sizeBytes / 1024 / 1024).toFixed(1)} MB) chargé avec succès et prêt !`,
+        message: `Modèle réel ${meta.name} (${(meta.sizeBytes / 1024 / 1024).toFixed(1)} MB) activé avec succès !`,
       });
     } catch (err: any) {
       setInferenceStatus({
@@ -329,23 +312,23 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
     setIsInferenceRunning(true);
     setInferenceStatus({
       type: 'info',
-      message: 'Exécution du modèle ONNX (19 classes) en WebAssembly...',
+      message: 'Exécution du modèle ONNX réel (19 classes) en WebAssembly...',
     });
 
     try {
       const result = await onnxEngine.runInference(activeImageRef.current, confidenceThreshold, 0.45);
       
+      setCustomDetections(result.boxes);
       if (result.boxes.length > 0) {
-        setCustomDetections(result.boxes);
         setInferenceStatus({
           type: 'success',
-          message: `Inférence réussie en ${result.inferenceTimeMs} ms : ${result.boxes.length} élément(s) parasitaire(s) identifié(s).`,
+          message: `Inférence ONNX réussie (${result.inferenceTimeMs} ms) : ${result.boxes.length} élément(s) détecté(s). Score max : ${(result.maxScoreFound * 100).toFixed(1)}%.`,
           duration: result.inferenceTimeMs,
         });
       } else {
         setInferenceStatus({
           type: 'warning',
-          message: `Inférence terminée (${result.inferenceTimeMs} ms) : aucun élément au seuil de ${Math.round(confidenceThreshold * 100)}%. Baissez le curseur de confiance ou testez une autre zone.`,
+          message: `Inférence ONNX terminée (${result.inferenceTimeMs} ms) : aucun élément au seuil de ${Math.round(confidenceThreshold * 100)}% (Score max trouvé : ${(result.maxScoreFound * 100).toFixed(1)}%). Baissez le seuil de confiance si nécessaire.`,
           duration: result.inferenceTimeMs,
         });
       }
@@ -360,93 +343,19 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
     }
   };
 
-  // Test simulation helper for all 19 parasites to verify MVP workflow
-  const handleRunSimulation = (speciesKey: string) => {
-    const cur = PARASITE_SPECIES[speciesKey] || PARASITE_SPECIES.hookworm;
-    const simBoxes: BoundingBox[] = [
-      {
-        id: `sim-box-${Date.now()}-1`,
-        classIndex: cur.classIndex,
-        speciesId: cur.id,
-        speciesName: cur.modelLabel,
-        speciesScientific: cur.scientificName,
-        stage: 'Diagnostic 19-Classes Simulé',
-        confidence: 0.962,
-        x: 36,
-        y: 32,
-        width: 26,
-        height: 32,
-        dimensionsUm: cur.typicalSize.split(' ')[0] || '60 x 45 µm',
-        color: cur.color,
-      },
-      {
-        id: `sim-box-${Date.now()}-2`,
-        classIndex: cur.classIndex,
-        speciesId: cur.id,
-        speciesName: cur.modelLabel,
-        speciesScientific: cur.scientificName,
-        stage: 'Diagnostic 19-Classes Simulé',
-        confidence: 0.915,
-        x: 64,
-        y: 55,
-        width: 22,
-        height: 28,
-        dimensionsUm: cur.typicalSize.split(' ')[0] || '58 x 42 µm',
-        color: cur.color,
-      },
-    ];
-    setCustomDetections(simBoxes);
-    setInferenceStatus({
-      type: 'success',
-      message: `Test simulé activé pour l'espèce [${cur.classIndex}: ${cur.modelLabel}]. Prêt pour génération de rapport médical !`,
-    });
-  };
-
-  // Add manual bounding box on click
-  const handleImageClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!isAnnotating) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const clickX = ((e.clientX - rect.left) / rect.width) * 100;
-    const clickY = ((e.clientY - rect.top) / rect.height) * 100;
-
-    const species = PARASITE_SPECIES[selectedSpeciesForManual] || PARASITE_SPECIES.hookworm;
-    const newBox: BoundingBox = {
-      id: `box-manual-${Date.now()}`,
-      classIndex: species.classIndex,
-      speciesId: species.id,
-      speciesName: species.modelLabel,
-      speciesScientific: species.scientificName,
-      stage: 'Annotated clinical element',
-      confidence: 0.98,
-      x: Math.max(0, Math.min(80, clickX - 10)),
-      y: Math.max(0, Math.min(80, clickY - 10)),
-      width: 20,
-      height: 20,
-      dimensionsUm: species.typicalSize.split(' ')[0] || '50 x 30 µm',
-      color: species.color,
-    };
-
-    setCustomDetections((prev) => [...prev, newBox]);
-    setSelectedBoxId(newBox.id);
-  };
-
   const removeDetection = (boxId: string) => {
     setCustomDetections((prev) => prev.filter((b) => b.id !== boxId));
     if (selectedBoxId === boxId) setSelectedBoxId(null);
   };
 
-  // Active image & detections
+  // Active image & detections: ONLY real ONNX detections!
   const currentSlide = SAMPLE_SLIDES[selectedSlideIndex];
   const activeImageSrc = (sourceType === 'custom_upload' || sourceType === 'captured_photo') 
     ? customImageSrc || currentSlide.imageSrc 
     : currentSlide.imageSrc;
 
-  const baseDetections = (sourceType === 'custom_upload' || sourceType === 'captured_photo')
-    ? customDetections
-    : currentSlide.detections;
-
-  // Filter detections by confidence
-  const visibleDetections = baseDetections.filter(
+  // Real ONNX detections exclusively
+  const visibleDetections = customDetections.filter(
     (box) => box.confidence >= confidenceThreshold
   );
 
@@ -602,14 +511,14 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
             )}
           </button>
 
-          {/* Quick Simulation Test Button */}
+          {/* Direct File Picker for exp.onnx */}
           <button
-            onClick={() => handleRunSimulation(selectedSpeciesForManual)}
-            className="hidden sm:flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700/80 text-xs text-amber-300 hover:bg-slate-700 transition-colors"
-            title="Tester immédiatement l'espèce sélectionnée"
+            onClick={() => modelFileInputRef.current?.click()}
+            className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-sky-950/80 border border-sky-700/80 text-xs text-sky-300 hover:bg-sky-900 transition-colors font-medium"
+            title="Sélectionner directement votre fichier exp.onnx"
           >
-            <Play className="w-3.5 h-3.5 text-amber-400" />
-            <span>Test Simulation</span>
+            <UploadCloud className="w-3.5 h-3.5 text-sky-400" />
+            <span>Charger exp.onnx</span>
           </button>
 
           {/* Hidden File Input for direct ONNX upload */}
@@ -740,10 +649,7 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
             
             /* Still Image Viewport with Bounding Boxes (Captured, Uploaded, or Reference Sample) */
             <div 
-              onClick={handleImageClick}
-              className={`relative max-w-full max-h-full rounded-lg overflow-hidden border border-slate-800 shadow-2xl flex items-center justify-center select-none ${
-                isAnnotating ? 'cursor-crosshair' : 'cursor-default'
-              }`}
+              className="relative max-w-full max-h-full rounded-lg overflow-hidden border border-slate-800 shadow-2xl flex items-center justify-center select-none"
               style={{
                 filter:
                   stainFilter === 'lugol'
@@ -840,13 +746,6 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
                 <div className="w-12 h-1 bg-white rounded-xs" />
                 <span>50 µm</span>
               </div>
-
-              {/* Annotating Tip Banner */}
-              {isAnnotating && (
-                <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-amber-500 text-slate-950 font-bold px-3 py-1 rounded-full text-xs shadow-lg animate-bounce pointer-events-none">
-                  Cliquez sur l'image pour marquer un طفيلي ({PARASITE_SPECIES[selectedSpeciesForManual]?.scientificName})
-                </div>
-              )}
             </div>
           )}
 
@@ -975,8 +874,8 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
               </div>
               <input
                 type="range"
-                min="0.50"
-                max="0.99"
+                min="0.05"
+                max="0.95"
                 step="0.01"
                 value={confidenceThreshold}
                 onChange={(e) => setConfidenceThreshold(parseFloat(e.target.value))}
@@ -985,23 +884,15 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
             </div>
           </div>
 
-          {/* Section B: 19 Parasites Selector & Manual Annotation Mode */}
+          {/* Section B: 19 Parasites Reference Dictionary for ONNX Model */}
           <div className="p-3 border-b border-slate-800 bg-slate-950/70 text-xs">
             <div className="flex items-center justify-between mb-2">
               <span className="font-semibold text-slate-300">
                 {t.panel19Parasites}
               </span>
-              <button
-                onClick={() => setIsAnnotating(!isAnnotating)}
-                className={`px-2 py-1 rounded text-[11px] font-bold flex items-center gap-1 transition-all ${
-                  isAnnotating
-                    ? 'bg-amber-500 text-slate-950 shadow-sm'
-                    : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
-                }`}
-              >
-                <PlusCircle className="w-3.5 h-3.5" />
-                <span>{isAnnotating ? 'Mode Clic Actif' : '+ Marquer'}</span>
-              </button>
+              <span className="text-[10px] bg-sky-950 text-sky-400 border border-sky-800 px-2 py-0.5 rounded font-mono font-semibold">
+                Classes 0 à 18
+              </span>
             </div>
 
             {/* Select among 19 Parasites dropdown mapped 0 to 18 */}

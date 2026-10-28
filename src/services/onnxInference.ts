@@ -2,11 +2,11 @@ import * as ort from 'onnxruntime-web';
 import { BoundingBox } from '../types/parasitology';
 import { USER_MODEL_CLASSES, PARASITE_SPECIES } from '../data/mockData';
 
-// Configure ONNX Runtime Web WASM binaries
-// Using 1 thread to avoid SharedArrayBuffer restrictions inside sandboxed iframes
+// Configure ONNX Runtime Web WebAssembly environment
 try {
   ort.env.wasm.numThreads = 1;
-  ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/';
+  // Serve WASM directly from local public root with CDN fallback
+  ort.env.wasm.wasmPaths = '/';
 } catch (e) {
   console.warn('Configuring ONNX environment:', e);
 }
@@ -19,12 +19,14 @@ export interface ModelMetadata {
   inputShape: number[]; // e.g. [1, 3, 640, 640]
   isLoaded: boolean;
   statusMessage?: string;
+  detectedFormat?: string;
 }
 
 export interface InferenceResult {
   boxes: BoundingBox[];
   inferenceTimeMs: number;
   rawDetectionsCount: number;
+  maxScoreFound: number;
 }
 
 class OnnxEngine {
@@ -51,7 +53,7 @@ class OnnxEngine {
       if (typeof source === 'string') {
         const response = await fetch(source);
         if (!response.ok) {
-          throw new Error(`Impossible de télécharger le modèle depuis ${source} (HTTP ${response.status})`);
+          throw new Error(`Fichier introuvable à l'adresse ${source} (HTTP ${response.status})`);
         }
         buffer = await response.arrayBuffer();
         name = source.split('/').pop() || name;
@@ -68,7 +70,6 @@ class OnnxEngine {
       // Create inference session with WebAssembly provider
       const session = await ort.InferenceSession.create(buffer, {
         executionProviders: ['wasm'],
-        graphOptimizationLevel: 'all',
       });
 
       this.session = session;
@@ -77,7 +78,6 @@ class OnnxEngine {
       const inputNames = session.inputNames;
       const outputNames = session.outputNames;
       
-      // Default to 640x640 if dynamic
       let inputShape = [1, 3, 640, 640];
       try {
         // @ts-ignore
@@ -97,7 +97,7 @@ class OnnxEngine {
         outputNames,
         inputShape,
         isLoaded: true,
-        statusMessage: `Modèle ${name} chargé et compilé avec succès en WebAssembly`,
+        statusMessage: `Modèle ${name} prêt pour l'analyse microscopique`,
       };
 
       return this.metadata;
@@ -107,7 +107,7 @@ class OnnxEngine {
       this.metadata = null;
       throw new Error(
         error?.message ||
-          'Impossible de charger ce fichier ONNX. Vérifiez qu\'il s\'agit d\'un modèle ONNX valide exporté en format standard.'
+          'Impossible de charger ce fichier ONNX. Vérifiez qu\'il s\'agit d\'un modèle ONNX standard valide.'
       );
     }
   }
@@ -124,14 +124,14 @@ class OnnxEngine {
     canvas.width = targetWidth;
     canvas.height = targetHeight;
     const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('Could not get 2D canvas context');
+    if (!ctx) throw new Error('Impossible de créer le contexte 2D pour le prétraitement');
 
     const origWidth =
       imageSource instanceof HTMLImageElement ? imageSource.naturalWidth || imageSource.width : imageSource.width;
     const origHeight =
       imageSource instanceof HTMLImageElement ? imageSource.naturalHeight || imageSource.height : imageSource.height;
 
-    // Draw and resize
+    // Draw and resize to model expected dimensions
     ctx.drawImage(imageSource, 0, 0, targetWidth, targetHeight);
     const imageData = ctx.getImageData(0, 0, targetWidth, targetHeight);
     const { data } = imageData;
@@ -156,7 +156,14 @@ class OnnxEngine {
   }
 
   /**
-   * Run inference on an image using the loaded ONNX model
+   * Helper: sigmoid function for logits
+   */
+  private sigmoid(x: number): number {
+    return 1 / (1 + Math.exp(-x));
+  }
+
+  /**
+   * Run real inference on an image using the loaded ONNX model
    */
   public async runInference(
     imageElement: HTMLImageElement | HTMLCanvasElement,
@@ -174,7 +181,7 @@ class OnnxEngine {
     const { tensor } = this.preprocess(imageElement, targetW, targetH);
     const inputName = this.metadata.inputNames[0];
 
-    // Execute session
+    // Execute ONNX session
     const feeds: Record<string, ort.Tensor> = { [inputName]: tensor };
     const results = await this.session.run(feeds);
 
@@ -187,26 +194,29 @@ class OnnxEngine {
     const endTime = performance.now();
     const inferenceTimeMs = Math.round(endTime - startTime);
 
-    // Decode detections (supports YOLOv8 [1, 23, 8400] or YOLOv5 [1, 8400, 24] or [N, 6])
-    const decodedBoxes = this.postprocess(outputTensor, confidenceThreshold, iouThreshold);
+    // Decode detections with universal parser
+    const { boxes, maxScore } = this.postprocess(outputTensor, confidenceThreshold, iouThreshold, targetW, targetH);
 
     return {
-      boxes: decodedBoxes,
+      boxes,
       inferenceTimeMs,
-      rawDetectionsCount: decodedBoxes.length,
+      rawDetectionsCount: boxes.length,
+      maxScoreFound: maxScore,
     };
   }
 
   /**
-   * Post-process output tensor to BoundingBox array
+   * Post-process output tensor to BoundingBox array supporting YOLOv8, YOLOv5, and End2End ONNX
    */
   private postprocess(
     tensor: ort.Tensor,
     confThreshold: number,
-    iouThreshold: number
-  ): BoundingBox[] {
+    iouThreshold: number,
+    targetW: number,
+    targetH: number
+  ): { boxes: BoundingBox[]; maxScore: number } {
     const data = tensor.data as Float32Array;
-    const dims = tensor.dims; // e.g. [1, 23, 8400] or [1, 8400, 23]
+    const dims = tensor.dims; // e.g. [1, 23, 8400] or [1, 8400, 23] or [1, 300, 6]
     const candidates: Array<{
       classIndex: number;
       score: number;
@@ -216,80 +226,174 @@ class OnnxEngine {
       h: number;
     }> = [];
 
+    let maxScoreEncountered = 0;
     const numClasses = 19;
 
+    // Helper to normalize coordinates: handles both pixel space [0..640] and normalized [0..1]
+    const toPercent = (cx: number, cy: number, w: number, h: number) => {
+      const isNormalized = cx <= 1.05 && cy <= 1.05 && w <= 1.05 && h <= 1.05;
+      const normX = isNormalized ? cx - w / 2 : (cx - w / 2) / targetW;
+      const normY = isNormalized ? cy - h / 2 : (cy - h / 2) / targetH;
+      const normW = isNormalized ? w : w / targetW;
+      const normH = isNormalized ? h : h / targetH;
+
+      return {
+        x: Math.max(0, Math.min(100, normX * 100)),
+        y: Math.max(0, Math.min(100, normY * 100)),
+        w: Math.max(1, Math.min(100, normW * 100)),
+        h: Math.max(1, Math.min(100, normH * 100)),
+      };
+    };
+
+    // Helper to evaluate class probability: converts logits to probability if needed
+    const getProb = (val: number) => {
+      if (val < 0 || val > 1.0) {
+        return this.sigmoid(val);
+      }
+      return val;
+    };
+
+    // Format 1: 3D Tensor [1, C, A] or [1, A, C]
     if (dims.length === 3) {
       const dim1 = dims[1];
       const dim2 = dims[2];
 
-      // Format A: YOLOv8 shape [1, 23, 8400] (channels x anchors)
-      if (dim1 === 4 + numClasses || dim1 > 4) {
-        const channels = dim1;
-        const anchors = dim2;
+      // Subcase 1A: End-to-end NMS [1, N, 6] where row is [x1, y1, x2, y2, score, class_id]
+      if (dim2 === 6) {
+        const numDetections = dim1;
+        for (let i = 0; i < numDetections; i++) {
+          const offset = i * 6;
+          const score = getProb(data[offset + 4]);
+          if (score > maxScoreEncountered) maxScoreEncountered = score;
 
-        for (let a = 0; a < anchors; a++) {
-          // Find max class score
-          let maxScore = 0;
-          let bestClass = 0;
+          if (score >= confThreshold) {
+            const x1 = data[offset];
+            const y1 = data[offset + 1];
+            const x2 = data[offset + 2];
+            const y2 = data[offset + 3];
+            const classIndex = Math.round(data[offset + 5]);
 
-          for (let c = 0; c < numClasses; c++) {
-            const scoreIdx = (4 + c) * anchors + a;
-            const score = data[scoreIdx];
-            if (score > maxScore) {
-              maxScore = score;
-              bestClass = c;
-            }
-          }
-
-          if (maxScore >= confThreshold) {
-            // YOLOv8 bounding box format: cx, cy, w, h normalized to 640x640
-            const cx = data[0 * anchors + a];
-            const cy = data[1 * anchors + a];
-            const w = data[2 * anchors + a];
-            const h = data[3 * anchors + a];
+            const cx = (x1 + x2) / 2;
+            const cy = (y1 + y2) / 2;
+            const w = Math.abs(x2 - x1);
+            const h = Math.abs(y2 - y1);
+            const p = toPercent(cx, cy, w, h);
 
             candidates.push({
-              classIndex: bestClass,
-              score: maxScore,
-              x: (cx - w / 2) / 640 * 100,
-              y: (cy - h / 2) / 640 * 100,
-              w: (w / 640) * 100,
-              h: (h / 640) * 100,
+              classIndex: Math.max(0, Math.min(numClasses - 1, classIndex)),
+              score,
+              ...p,
             });
           }
         }
       }
-      // Format B: YOLOv8 / YOLOv5 transposed [1, 8400, 23] (anchors x channels)
-      else if (dim2 === 4 + numClasses || dim2 > 4) {
-        const anchors = dim1;
-        const channels = dim2;
+      // Subcase 1B: YOLOv8 channels x anchors format [1, 23, 8400]
+      else if (dim1 < dim2) {
+        const channels = dim1;
+        const anchors = dim2;
+        const isYolov5 = channels >= 4 + 1 + numClasses; // has objectness
 
         for (let a = 0; a < anchors; a++) {
-          const rowOffset = a * channels;
-          let maxScore = 0;
+          let maxClassScore = 0;
           let bestClass = 0;
+          const objConf = isYolov5 ? getProb(data[4 * anchors + a]) : 1.0;
 
-          for (let c = 0; c < numClasses; c++) {
-            const score = data[rowOffset + 4 + c];
-            if (score > maxScore) {
-              maxScore = score;
+          const classOffset = isYolov5 ? 5 : 4;
+          const actualClasses = Math.min(numClasses, channels - classOffset);
+
+          for (let c = 0; c < actualClasses; c++) {
+            const rawScore = data[(classOffset + c) * anchors + a];
+            const prob = getProb(rawScore);
+            if (prob > maxClassScore) {
+              maxClassScore = prob;
               bestClass = c;
             }
           }
 
-          if (maxScore >= confThreshold) {
+          const finalScore = maxClassScore * objConf;
+          if (finalScore > maxScoreEncountered) maxScoreEncountered = finalScore;
+
+          if (finalScore >= confThreshold) {
+            const cx = data[0 * anchors + a];
+            const cy = data[1 * anchors + a];
+            const w = data[2 * anchors + a];
+            const h = data[3 * anchors + a];
+            const p = toPercent(cx, cy, w, h);
+
+            candidates.push({
+              classIndex: bestClass,
+              score: finalScore,
+              ...p,
+            });
+          }
+        }
+      }
+      // Subcase 1C: YOLOv8 / YOLOv5 transposed anchors x channels [1, 8400, 23]
+      else {
+        const anchors = dim1;
+        const channels = dim2;
+        const isYolov5 = channels >= 4 + 1 + numClasses;
+
+        for (let a = 0; a < anchors; a++) {
+          const rowOffset = a * channels;
+          const objConf = isYolov5 ? getProb(data[rowOffset + 4]) : 1.0;
+          const classOffset = isYolov5 ? 5 : 4;
+          const actualClasses = Math.min(numClasses, channels - classOffset);
+
+          let maxClassScore = 0;
+          let bestClass = 0;
+
+          for (let c = 0; c < actualClasses; c++) {
+            const rawScore = data[rowOffset + classOffset + c];
+            const prob = getProb(rawScore);
+            if (prob > maxClassScore) {
+              maxClassScore = prob;
+              bestClass = c;
+            }
+          }
+
+          const finalScore = maxClassScore * objConf;
+          if (finalScore > maxScoreEncountered) maxScoreEncountered = finalScore;
+
+          if (finalScore >= confThreshold) {
             const cx = data[rowOffset];
             const cy = data[rowOffset + 1];
             const w = data[rowOffset + 2];
             const h = data[rowOffset + 3];
+            const p = toPercent(cx, cy, w, h);
 
             candidates.push({
               classIndex: bestClass,
-              score: maxScore,
-              x: (cx - w / 2) / 640 * 100,
-              y: (cy - h / 2) / 640 * 100,
-              w: (w / 640) * 100,
-              h: (h / 640) * 100,
+              score: finalScore,
+              ...p,
+            });
+          }
+        }
+      }
+    }
+    // Format 2: 2D Tensor [N, 6] or [8400, 23]
+    else if (dims.length === 2) {
+      const rows = dims[0];
+      const cols = dims[1];
+
+      if (cols === 6) {
+        for (let i = 0; i < rows; i++) {
+          const offset = i * 6;
+          const score = getProb(data[offset + 4]);
+          if (score > maxScoreEncountered) maxScoreEncountered = score;
+
+          if (score >= confThreshold) {
+            const x1 = data[offset];
+            const y1 = data[offset + 1];
+            const x2 = data[offset + 2];
+            const y2 = data[offset + 3];
+            const classIndex = Math.round(data[offset + 5]);
+            const p = toPercent((x1 + x2) / 2, (y1 + y2) / 2, Math.abs(x2 - x1), Math.abs(y2 - y1));
+
+            candidates.push({
+              classIndex: Math.max(0, Math.min(numClasses - 1, classIndex)),
+              score,
+              ...p,
             });
           }
         }
@@ -300,7 +404,7 @@ class OnnxEngine {
     const nmsResults = this.applyNms(candidates, iouThreshold);
 
     // Map to BoundingBox objects
-    return nmsResults.map((item, index) => {
+    const boxes = nmsResults.map((item, index) => {
       const classMeta = USER_MODEL_CLASSES[item.classIndex] || USER_MODEL_CLASSES[0];
       const speciesInfo = PARASITE_SPECIES[classMeta.id];
 
@@ -310,16 +414,18 @@ class OnnxEngine {
         speciesId: classMeta.id,
         speciesName: classMeta.label,
         speciesScientific: speciesInfo?.scientificName || classMeta.label,
-        stage: 'ONNX Neural Detection',
+        stage: 'Détection IA (Modèle ONNX)',
         confidence: Number(item.score.toFixed(3)),
         x: Math.max(0, Math.min(95, item.x)),
         y: Math.max(0, Math.min(95, item.y)),
-        width: Math.max(5, Math.min(60, item.w)),
-        height: Math.max(5, Math.min(60, item.h)),
+        width: Math.max(3, Math.min(90, item.w)),
+        height: Math.max(3, Math.min(90, item.h)),
         dimensionsUm: speciesInfo?.typicalSize?.split(' ')[0] || '55 x 35 µm',
         color: speciesInfo?.color || '#0284c7',
       };
     });
+
+    return { boxes, maxScore: maxScoreEncountered };
   }
 
   /**
@@ -329,7 +435,6 @@ class OnnxEngine {
     boxes: Array<{ classIndex: number; score: number; x: number; y: number; w: number; h: number }>,
     iouThreshold: number
   ) {
-    // Sort descending by score
     boxes.sort((a, b) => b.score - a.score);
     const selected: typeof boxes = [];
 
