@@ -1,0 +1,6 @@
+{
+  "name": "DAP - Digital Analysis of Parasitology",
+  "description": "Plateforme médicale professionnelle d'analyse microscopique par IA pour laboratoires et centres médicaux.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
