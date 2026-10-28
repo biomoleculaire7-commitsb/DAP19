@@ -282,10 +282,10 @@ export const OnnxModelModal: React.FC<OnnxModelModalProps> = ({
                         onRunTestInference();
                         onClose();
                       }}
-                      className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg flex items-center justify-center gap-2 shadow-sm transition-colors"
+                      className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg flex items-center justify-center gap-2 shadow-sm transition-colors text-xs cursor-pointer"
                     >
                       <Play className="w-4 h-4" />
-                      <span>Exécuter l'Inférence sur l'Image Active</span>
+                      <span>{language === 'ar' ? 'تشغيل الكاشف الحقيقي على العينة المعروضة الآن' : 'Exécuter l\'Inférence sur l\'Image Active'}</span>
                     </button>
                   )}
                 </div>

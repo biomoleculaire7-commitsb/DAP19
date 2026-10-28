@@ -44,9 +44,9 @@ class OnnxEngine {
   /**
    * Load an ONNX model from a File, ArrayBuffer, or URL path (e.g. /exp.onnx)
    */
-  public async loadModel(source: File | ArrayBuffer | string, modelName?: string): Promise<ModelMetadata> {
+  public async loadModel(source: File | ArrayBuffer | Uint8Array | string, modelName?: string): Promise<ModelMetadata> {
     try {
-      let buffer: ArrayBuffer;
+      let bufferBytes: Uint8Array;
       let name = modelName || 'exp.onnx';
       let sizeBytes = 0;
 
@@ -55,20 +55,25 @@ class OnnxEngine {
         if (!response.ok) {
           throw new Error(`Fichier introuvable à l'adresse ${source} (HTTP ${response.status})`);
         }
-        buffer = await response.arrayBuffer();
+        const ab = await response.arrayBuffer();
+        bufferBytes = new Uint8Array(ab);
         name = source.split('/').pop() || name;
-        sizeBytes = buffer.byteLength;
+        sizeBytes = ab.byteLength;
       } else if (source instanceof File) {
         name = source.name;
         sizeBytes = source.size;
-        buffer = await source.arrayBuffer();
+        const ab = await source.arrayBuffer();
+        bufferBytes = new Uint8Array(ab);
+      } else if (source instanceof Uint8Array) {
+        bufferBytes = source;
+        sizeBytes = source.byteLength;
       } else {
-        buffer = source;
-        sizeBytes = buffer.byteLength;
+        bufferBytes = new Uint8Array(source);
+        sizeBytes = bufferBytes.byteLength;
       }
 
       // Create inference session with WebAssembly provider
-      const session = await ort.InferenceSession.create(buffer, {
+      const session = await ort.InferenceSession.create(bufferBytes, {
         executionProviders: ['wasm'],
       });
 
@@ -81,7 +86,7 @@ class OnnxEngine {
       let inputShape = [1, 3, 640, 640];
       try {
         // @ts-ignore
-        const metaInput = session.inputMetadata?.[inputNames[0]];
+        const metaInput = session.inputMetadata?.[inputNames[0]] || (session as any)._inputs?.[0];
         if (metaInput && metaInput.dimensions) {
           inputShape = metaInput.dimensions.map((d: any) => (typeof d === 'number' && d > 0 ? d : 640));
           if (inputShape.length === 4 && inputShape[0] !== 1) inputShape[0] = 1;
@@ -99,6 +104,14 @@ class OnnxEngine {
         isLoaded: true,
         statusMessage: `Modèle ${name} prêt pour l'analyse microscopique`,
       };
+
+      console.log('✅ ONNX Session successfully created:', {
+        modelName: name,
+        inputNames,
+        outputNames,
+        inputShape,
+        sizeBytes,
+      });
 
       return this.metadata;
     } catch (error: any) {
@@ -163,22 +176,44 @@ class OnnxEngine {
   }
 
   /**
-   * Run real inference on an image using the loaded ONNX model
+   * Run real inference on an image or video frame using the loaded ONNX model
    */
   public async runInference(
-    imageElement: HTMLImageElement | HTMLCanvasElement,
-    confidenceThreshold: number = 0.5,
+    imageSource: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
+    confidenceThreshold: number = 0.25,
     iouThreshold: number = 0.45
   ): Promise<InferenceResult> {
     if (!this.session || !this.metadata) {
-      throw new Error('Aucun modèle ONNX n\'est actuellement chargé.');
+      throw new Error('Aucun modèle ONNX n\'est actuellement chargé. Veuillez charger exp.onnx d\'abord.');
+    }
+
+    let sourceElement: HTMLImageElement | HTMLCanvasElement;
+    if (imageSource instanceof HTMLVideoElement) {
+      const canvas = document.createElement('canvas');
+      canvas.width = imageSource.videoWidth || 1280;
+      canvas.height = imageSource.videoHeight || 720;
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.drawImage(imageSource, 0, 0, canvas.width, canvas.height);
+      sourceElement = canvas;
+    } else {
+      sourceElement = imageSource;
+      if (sourceElement instanceof HTMLImageElement) {
+        const img = sourceElement;
+        if (!img.complete || img.naturalWidth === 0) {
+          await new Promise<void>((resolve) => {
+            if (img.complete && img.naturalWidth > 0) return resolve();
+            img.onload = () => resolve();
+            setTimeout(resolve, 2000);
+          });
+        }
+      }
     }
 
     const startTime = performance.now();
     const targetW = this.metadata.inputShape[3] || 640;
     const targetH = this.metadata.inputShape[2] || 640;
 
-    const { tensor } = this.preprocess(imageElement, targetW, targetH);
+    const { tensor } = this.preprocess(sourceElement, targetW, targetH);
     const inputName = this.metadata.inputNames[0];
 
     // Execute ONNX session
@@ -188,7 +223,7 @@ class OnnxEngine {
     const outputName = this.metadata.outputNames[0];
     const outputTensor = results[outputName];
     if (!outputTensor) {
-      throw new Error(`Le tenseur de sortie ${outputName} est introuvable.`);
+      throw new Error(`Le tenseur de sortie ${outputName} est introuvable dans le modèle.`);
     }
 
     const endTime = performance.now();
@@ -196,6 +231,13 @@ class OnnxEngine {
 
     // Decode detections with universal parser
     const { boxes, maxScore } = this.postprocess(outputTensor, confidenceThreshold, iouThreshold, targetW, targetH);
+
+    console.log('[ONNX Inference complete]', {
+      timeMs: inferenceTimeMs,
+      maxScoreFound: maxScore,
+      boxesCount: boxes.length,
+      thresholdUsed: confidenceThreshold,
+    });
 
     return {
       boxes,

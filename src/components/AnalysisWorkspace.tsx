@@ -85,7 +85,9 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
   const modelFileInputRef = useRef<HTMLInputElement>(null);
 
   // ONNX model status & runtime state
-  const [uploadedModelName, setUploadedModelName] = useState<string | null>('exp.onnx');
+  const [uploadedModelName, setUploadedModelName] = useState<string | null>(
+    onnxEngine.isReady() ? onnxEngine.getMetadata()?.name || 'exp.onnx' : null
+  );
   const [isModelLoaded, setIsModelLoaded] = useState<boolean>(onnxEngine.isReady());
   const [isOnnxModalOpen, setIsOnnxModalOpen] = useState<boolean>(false);
   const [isInferenceRunning, setIsInferenceRunning] = useState<boolean>(false);
@@ -135,18 +137,32 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
   // Try preloading exp.onnx on mount if hosted on server
   useEffect(() => {
     async function checkPreloadedModel() {
-      if (onnxEngine.isReady()) return;
+      if (onnxEngine.isReady()) {
+        setIsModelLoaded(true);
+        setUploadedModelName(onnxEngine.getMetadata()?.name || 'exp.onnx');
+        return;
+      }
       try {
         const meta = await onnxEngine.loadModel('/models/exp.onnx', 'exp.onnx');
         setUploadedModelName(meta.name);
         setIsModelLoaded(true);
+        setInferenceStatus({
+          type: 'success',
+          message: language === 'ar' ? 'تم تنشيط نموذج exp.onnx بنجاح' : 'Modèle exp.onnx activé avec succès',
+        });
       } catch (e1) {
         try {
           const meta = await onnxEngine.loadModel('/exp.onnx', 'exp.onnx');
           setUploadedModelName(meta.name);
           setIsModelLoaded(true);
+          setInferenceStatus({
+            type: 'success',
+            message: language === 'ar' ? 'تم تنشيط نموذج exp.onnx بنجاح' : 'Modèle exp.onnx activé avec succès',
+          });
         } catch (e2) {
-          // Model will be loaded by user via file picker
+          // Model will be uploaded directly by user via file picker
+          setIsModelLoaded(false);
+          setUploadedModelName(null);
         }
       }
     }
@@ -264,47 +280,73 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
       if (file.name.toLowerCase().endsWith('.pt') || file.name.toLowerCase().endsWith('.pth')) {
         setInferenceStatus({
           type: 'error',
-          message:
-            'Format PyTorch (.pt) détecté ! Le navigateur requiert le format ONNX (.onnx). Veuillez exporter en ONNX.',
+          message: language === 'ar'
+            ? 'تم اكتشاف صيغة PyTorch (.pt)! المتصفح يتطلب صيغة ONNX (.onnx). يرجى تصدير النموذج إلى ONNX.'
+            : 'Format PyTorch (.pt) détecté ! Le navigateur requiert le format ONNX (.onnx). Veuillez exporter en ONNX.',
         });
         setIsOnnxModalOpen(true);
         return;
       }
       setInferenceStatus({
         type: 'error',
-        message: 'Fichier invalide : veuillez sélectionner votre modèle au format .onnx (exp.onnx)',
+        message: language === 'ar' 
+          ? 'ملف غير صالح: يرجى اختيار ملف النموذج بصيغة .onnx (مثل exp.onnx)'
+          : 'Fichier invalide : veuillez sélectionner votre modèle au format .onnx (exp.onnx)',
       });
       return;
     }
 
     try {
-      setInferenceStatus({ type: 'info', message: `Chargement du modèle ${file.name} en WebAssembly...` });
+      setInferenceStatus({ 
+        type: 'info', 
+        message: language === 'ar'
+          ? `جاري تحميل النموذج ${file.name} وتخصيص ذاكرة WebAssembly...`
+          : `Chargement du modèle ${file.name} en WebAssembly...` 
+      });
       const meta = await onnxEngine.loadModel(file);
       setUploadedModelName(meta.name);
       setIsModelLoaded(true);
       setInferenceStatus({
         type: 'success',
-        message: `Modèle réel ${meta.name} (${(meta.sizeBytes / 1024 / 1024).toFixed(1)} MB) activé avec succès !`,
+        message: language === 'ar'
+          ? `تم تفعيل النموذج الحقيقي ${meta.name} (${(meta.sizeBytes / 1024 / 1024).toFixed(1)} MB) بنجاح! جاري فحص الحقل المجهري...`
+          : `Modèle réel ${meta.name} (${(meta.sizeBytes / 1024 / 1024).toFixed(1)} MB) activé avec succès ! Analyse en cours...`,
       });
+
+      // Automatically execute inference on current slide/image
+      setTimeout(() => {
+        handleRunInferenceWithEngine();
+      }, 350);
     } catch (err: any) {
       setInferenceStatus({
         type: 'error',
-        message: `Échec du chargement : ${err?.message || 'Erreur interne WebAssembly'}`,
+        message: language === 'ar'
+          ? `فشل تحميل النموذج ONNX: ${err?.message || 'خطأ داخلي في WebAssembly'}`
+          : `Échec du chargement : ${err?.message || 'Erreur interne WebAssembly'}`,
       });
     }
   };
 
-  // Run real in-browser ONNX inference on active image
-  const handleRunInference = async () => {
+  // Run real in-browser ONNX inference on active image or camera frame
+  const handleRunInferenceWithEngine = async () => {
     if (!onnxEngine.isReady()) {
       setIsOnnxModalOpen(true);
       return;
     }
 
-    if (!activeImageRef.current) {
+    let targetElement: HTMLImageElement | HTMLVideoElement | null = null;
+    if (sourceType === 'real_camera' && videoRef.current) {
+      targetElement = videoRef.current;
+    } else if (activeImageRef.current) {
+      targetElement = activeImageRef.current;
+    }
+
+    if (!targetElement) {
       setInferenceStatus({
         type: 'warning',
-        message: 'Veuillez sélectionner ou capturer une image de microscope avant de lancer l\'inférence.',
+        message: language === 'ar'
+          ? 'يرجى اختيار شريحة عينة أو رفع صورة أو تشغيل الكاميرا قبل تشغيل الكاشف.'
+          : 'Veuillez sélectionner ou capturer une image de microscope avant de lancer l\'inférence.',
       });
       return;
     }
@@ -312,23 +354,29 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
     setIsInferenceRunning(true);
     setInferenceStatus({
       type: 'info',
-      message: 'Exécution du modèle ONNX réel (19 classes) en WebAssembly...',
+      message: language === 'ar'
+        ? 'جاري فحص العينة بواسطة النموذج الحقيقي exp.onnx (19 طفيلي)...'
+        : 'Exécution du modèle ONNX réel (19 classes) en WebAssembly...',
     });
 
     try {
-      const result = await onnxEngine.runInference(activeImageRef.current, confidenceThreshold, 0.45);
+      const result = await onnxEngine.runInference(targetElement, confidenceThreshold, 0.45);
       
       setCustomDetections(result.boxes);
       if (result.boxes.length > 0) {
         setInferenceStatus({
           type: 'success',
-          message: `Inférence ONNX réussie (${result.inferenceTimeMs} ms) : ${result.boxes.length} élément(s) détecté(s). Score max : ${(result.maxScoreFound * 100).toFixed(1)}%.`,
+          message: language === 'ar'
+            ? `اكتمل الفحص (${result.inferenceTimeMs} ms): تم رصد ${result.boxes.length} عنصر/طفيلي. أعلى نسبة ثقة: ${(result.maxScoreFound * 100).toFixed(1)}%.`
+            : `Inférence ONNX réussie (${result.inferenceTimeMs} ms) : ${result.boxes.length} élément(s) détecté(s). Score max : ${(result.maxScoreFound * 100).toFixed(1)}%.`,
           duration: result.inferenceTimeMs,
         });
       } else {
         setInferenceStatus({
           type: 'warning',
-          message: `Inférence ONNX terminée (${result.inferenceTimeMs} ms) : aucun élément au seuil de ${Math.round(confidenceThreshold * 100)}% (Score max trouvé : ${(result.maxScoreFound * 100).toFixed(1)}%). Baissez le seuil de confiance si nécessaire.`,
+          message: language === 'ar'
+            ? `انتهى فحص exp.onnx (${result.inferenceTimeMs} ms): لم يتم رصد أي طفيليات أعلى من عتبة ${Math.round(confidenceThreshold * 100)}% (أعلى احتمال مسجل في الحقل: ${(result.maxScoreFound * 100).toFixed(1)}%). يمكنك خفض عتبة الدقة لرؤية العناصر الأضعف.`
+            : `Inférence ONNX terminée (${result.inferenceTimeMs} ms) : aucun élément au seuil de ${Math.round(confidenceThreshold * 100)}% (Score max trouvé : ${(result.maxScoreFound * 100).toFixed(1)}%). Baissez le seuil de confiance si nécessaire.`,
           duration: result.inferenceTimeMs,
         });
       }
@@ -336,12 +384,16 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
       console.error('Inference error:', err);
       setInferenceStatus({
         type: 'error',
-        message: `Erreur d'inférence ONNX : ${err?.message || 'Incompatibilité de tenseur'}`,
+        message: language === 'ar'
+          ? `خطأ أثناء تنفيذ نموذج ONNX: ${err?.message || 'عدم توافق في أبعاد التنسور'}`
+          : `Erreur d'inférence ONNX : ${err?.message || 'Incompatibilité de tenseur'}`,
       });
     } finally {
       setIsInferenceRunning(false);
     }
   };
+
+  const handleRunInference = () => handleRunInferenceWithEngine();
 
   const removeDetection = (boxId: string) => {
     setCustomDetections((prev) => prev.filter((b) => b.id !== boxId));
@@ -460,6 +512,12 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
                   setSourceType('samples');
                   setSelectedSlideIndex(index);
                   setSelectedBoxId(null);
+                  setCustomDetections([]); // strictly 0 detections until real ONNX runs
+                  if (onnxEngine.isReady()) {
+                    setTimeout(() => {
+                      handleRunInferenceWithEngine();
+                    }, 200);
+                  }
                 }}
                 className={`px-2.5 py-1 rounded text-[11px] whitespace-nowrap transition-colors ${
                   sourceType === 'samples' && selectedSlideIndex === index
@@ -481,44 +539,66 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
           <button
             onClick={handleRunInference}
             disabled={isInferenceRunning}
-            className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 text-xs transition-all ${
+            className={`px-3.5 py-1.5 rounded-lg font-bold flex items-center gap-1.5 text-xs transition-all cursor-pointer ${
               isInferenceRunning
                 ? 'bg-sky-700 text-white cursor-wait opacity-80'
+                : isModelLoaded
+                ? 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-md shadow-emerald-950 ring-1 ring-emerald-400'
                 : 'bg-gradient-to-r from-sky-600 to-indigo-600 hover:from-sky-500 hover:to-indigo-500 text-white shadow-md shadow-sky-950 ring-1 ring-sky-400'
             }`}
-            title="Exécuter le modèle ONNX (19 classes) sur l'image affichée"
+            title={language === 'ar' ? 'تشغيل فحص الذكاء الاصطناعي ONNX' : "Exécuter le modèle ONNX (19 classes) sur l'image affichée"}
           >
             {isInferenceRunning ? (
               <RefreshCw className="w-3.5 h-3.5 animate-spin text-white" />
             ) : (
               <Sparkles className="w-3.5 h-3.5 text-amber-300" />
             )}
-            <span>{isInferenceRunning ? 'Inférence...' : '⚡ Lancer Inférence IA'}</span>
+            <span>
+              {isInferenceRunning
+                ? (language === 'ar' ? 'جاري الفحص...' : 'Inférence...')
+                : (language === 'ar' ? '⚡ تشغيل الكاشف الحقيقي ONNX' : '⚡ Lancer Inférence IA')}
+            </span>
           </button>
 
-          {/* ONNX Model Diagnostic / Settings Modal Trigger */}
+          {/* ONNX Model Status Trigger */}
           <button
             onClick={() => setIsOnnxModalOpen(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-200 hover:bg-slate-700 transition-colors"
-            title="Gérer le modèle ONNX (chargement, diagnostic, classes 0 à 18)"
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs transition-colors cursor-pointer ${
+              isModelLoaded
+                ? 'bg-emerald-950/80 border-emerald-600/80 text-emerald-300 hover:bg-emerald-900'
+                : 'bg-amber-950/80 border-amber-600/80 text-amber-300 hover:bg-amber-900'
+            }`}
+            title={language === 'ar' ? 'إدارة ومعاينة نموذج ONNX' : 'Gérer le modèle ONNX (chargement, diagnostic, classes 0 à 18)'}
           >
-            <Cpu className="w-3.5 h-3.5 text-sky-400" />
-            <span className="font-mono">{uploadedModelName || 'Modèle 19 Parasites'}</span>
+            <Cpu className="w-3.5 h-3.5" />
+            <span className="font-mono">{uploadedModelName || 'exp.onnx'}</span>
             {isModelLoaded ? (
-              <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-1 rounded font-bold">Actif</span>
+              <span className="text-[10px] bg-emerald-500 text-slate-950 px-1.5 py-0.2 rounded font-bold">
+                {language === 'ar' ? 'نشط' : 'Actif'}
+              </span>
             ) : (
-              <span className="text-[10px] bg-sky-500/20 text-sky-300 px-1 rounded">+ Configurer</span>
+              <span className="text-[10px] bg-amber-500 text-slate-950 px-1.5 py-0.2 rounded font-bold">
+                {language === 'ar' ? 'غير محمّل' : 'Non chargé'}
+              </span>
             )}
           </button>
 
           {/* Direct File Picker for exp.onnx */}
           <button
             onClick={() => modelFileInputRef.current?.click()}
-            className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-sky-950/80 border border-sky-700/80 text-xs text-sky-300 hover:bg-sky-900 transition-colors font-medium"
-            title="Sélectionner directement votre fichier exp.onnx"
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm cursor-pointer ${
+              !isModelLoaded
+                ? 'bg-amber-500 hover:bg-amber-400 text-slate-950 ring-2 ring-amber-300'
+                : 'bg-sky-950/80 border border-sky-700/80 text-sky-300 hover:bg-sky-900'
+            }`}
+            title={language === 'ar' ? 'اختر ملف exp.onnx من جهازك' : 'Sélectionner directement votre fichier exp.onnx'}
           >
-            <UploadCloud className="w-3.5 h-3.5 text-sky-400" />
-            <span>Charger exp.onnx</span>
+            <UploadCloud className="w-3.5 h-3.5" />
+            <span>
+              {isModelLoaded
+                ? (language === 'ar' ? 'تغيير exp.onnx' : 'Changer exp.onnx')
+                : (language === 'ar' ? '📥 رفع exp.onnx' : '📥 Charger exp.onnx')}
+            </span>
           </button>
 
           {/* Hidden File Input for direct ONNX upload */}
@@ -584,6 +664,42 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
               title="Fermer"
             >
               <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Notice Banner when exp.onnx is not yet loaded */}
+      {!isModelLoaded && (
+        <div className="bg-amber-950/90 border-b border-amber-600/60 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs shrink-0 shadow-inner">
+          <div className="flex items-center gap-2.5 text-amber-200">
+            <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 animate-pulse" />
+            <div>
+              <span className="font-bold text-amber-300">
+                {language === 'ar' 
+                  ? 'تنبيه سريري: تم إلغاء كافة الكواشف التجريبية والمحاكاة لضمان دقة التحليل.'
+                  : 'Alerte Clinique : Toutes les détections simulées ont été purgées.'}
+              </span>
+              <span className="block text-[11px] text-amber-200/80 mt-0.5">
+                {language === 'ar'
+                  ? 'يرجى رفع ملف النموذج الحقيقي (exp.onnx) لتشغيل الكاشف بدقة على الـ 19 فئة طفيلية.'
+                  : 'Veuillez charger votre modèle réel (exp.onnx) pour lancer la détection sur les 19 classes.'}
+              </span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => modelFileInputRef.current?.click()}
+              className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg shadow-md flex items-center gap-2 cursor-pointer transition-transform active:scale-95 text-xs"
+            >
+              <UploadCloud className="w-4 h-4 text-slate-950" />
+              <span>{language === 'ar' ? '📥 رفع ملف exp.onnx الآن' : '📥 Charger exp.onnx'}</span>
+            </button>
+            <button
+              onClick={() => setIsOnnxModalOpen(true)}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 rounded-lg border border-amber-700/50 text-xs cursor-pointer"
+            >
+              {language === 'ar' ? 'فحص التنسور' : 'Diagnostic'}
             </button>
           </div>
         </div>
