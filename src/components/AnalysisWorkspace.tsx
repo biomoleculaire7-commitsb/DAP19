@@ -12,6 +12,7 @@ import {
 import { translations } from '../translations';
 import { SAMPLE_SLIDES, PARASITE_SPECIES, USER_MODEL_CLASSES } from '../data/mockData';
 import { onnxEngine, ModelMetadata } from '../services/onnxInference';
+import { unifiedModelService, SupportedModelFormat } from '../services/unifiedModelService';
 import { OnnxModelModal } from './OnnxModelModal';
 import { 
   Video, 
@@ -84,11 +85,12 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const modelFileInputRef = useRef<HTMLInputElement>(null);
 
-  // ONNX model status & runtime state
+  // Unified model status & runtime state (ONNX & TFLite)
+  const [activeModelFormat, setActiveModelFormat] = useState<SupportedModelFormat>('onnx');
   const [uploadedModelName, setUploadedModelName] = useState<string | null>(
-    onnxEngine.isReady() ? onnxEngine.getMetadata()?.name || 'exp.onnx' : null
+    unifiedModelService.isReady() ? unifiedModelService.getModelInfo()?.name || 'exp.onnx' : null
   );
-  const [isModelLoaded, setIsModelLoaded] = useState<boolean>(onnxEngine.isReady());
+  const [isModelLoaded, setIsModelLoaded] = useState<boolean>(unifiedModelService.isReady());
   const [isOnnxModalOpen, setIsOnnxModalOpen] = useState<boolean>(false);
   const [isInferenceRunning, setIsInferenceRunning] = useState<boolean>(false);
   const [inferenceStatus, setInferenceStatus] = useState<{
@@ -134,37 +136,43 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
     getDevices();
   }, []);
 
-  // Try preloading exp.onnx on mount if hosted on server
+  // Try preloading model on mount if hosted on server (ONNX or TFLite)
   useEffect(() => {
     async function checkPreloadedModel() {
-      if (onnxEngine.isReady()) {
+      if (unifiedModelService.isReady()) {
+        const info = unifiedModelService.getModelInfo();
         setIsModelLoaded(true);
-        setUploadedModelName(onnxEngine.getMetadata()?.name || 'exp.onnx');
+        setUploadedModelName(info?.name || 'exp.onnx');
+        setActiveModelFormat(info?.format || 'onnx');
         return;
       }
-      try {
-        const meta = await onnxEngine.loadModel('/models/exp.onnx', 'exp.onnx');
-        setUploadedModelName(meta.name);
-        setIsModelLoaded(true);
-        setInferenceStatus({
-          type: 'success',
-          message: language === 'ar' ? 'تم تنشيط نموذج exp.onnx بنجاح' : 'Modèle exp.onnx activé avec succès',
-        });
-      } catch (e1) {
+      const candidates = [
+        '/models/exp.onnx',
+        '/exp.onnx',
+        '/models/model.tflite',
+        '/model.tflite',
+        '/models/exp.tflite',
+        '/exp.tflite',
+      ];
+      for (const path of candidates) {
         try {
-          const meta = await onnxEngine.loadModel('/exp.onnx', 'exp.onnx');
-          setUploadedModelName(meta.name);
+          const info = await unifiedModelService.loadModel(path);
+          setUploadedModelName(info.name);
+          setActiveModelFormat(info.format);
           setIsModelLoaded(true);
           setInferenceStatus({
             type: 'success',
-            message: language === 'ar' ? 'تم تنشيط نموذج exp.onnx بنجاح' : 'Modèle exp.onnx activé avec succès',
+            message: language === 'ar' 
+              ? `تم تنشيط نموذج ${info.format.toUpperCase()} (${info.name}) بنجاح`
+              : `Modèle ${info.format.toUpperCase()} (${info.name}) activé avec succès`,
           });
-        } catch (e2) {
-          // Model will be uploaded directly by user via file picker
-          setIsModelLoaded(false);
-          setUploadedModelName(null);
+          return;
+        } catch (e) {
+          // continue checking
         }
       }
+      setIsModelLoaded(false);
+      setUploadedModelName(null);
     }
     checkPreloadedModel();
   }, []);
@@ -271,18 +279,21 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
     }
   };
 
-  // Handle ONNX model file upload directly or via modal
+  // Handle model file upload (ONNX or TFLite) directly or via modal
   const handleModelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (!file.name.toLowerCase().endsWith('.onnx')) {
-      if (file.name.toLowerCase().endsWith('.pt') || file.name.toLowerCase().endsWith('.pth')) {
+    const lower = file.name.toLowerCase();
+    const isSupported = lower.endsWith('.onnx') || lower.endsWith('.tflite') || lower.endsWith('.lite');
+
+    if (!isSupported) {
+      if (lower.endsWith('.pt') || lower.endsWith('.pth')) {
         setInferenceStatus({
           type: 'error',
           message: language === 'ar'
-            ? 'تم اكتشاف صيغة PyTorch (.pt)! المتصفح يتطلب صيغة ONNX (.onnx). يرجى تصدير النموذج إلى ONNX.'
-            : 'Format PyTorch (.pt) détecté ! Le navigateur requiert le format ONNX (.onnx). Veuillez exporter en ONNX.',
+            ? 'تم اكتشاف صيغة PyTorch (.pt)! المتصفح يدعم صيغ الويب ONNX (.onnx) و TensorFlow Lite (.tflite).'
+            : 'Format PyTorch (.pt) détecté ! Le navigateur requiert .onnx ou .tflite.',
         });
         setIsOnnxModalOpen(true);
         return;
@@ -290,27 +301,30 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
       setInferenceStatus({
         type: 'error',
         message: language === 'ar' 
-          ? 'ملف غير صالح: يرجى اختيار ملف النموذج بصيغة .onnx (مثل exp.onnx)'
-          : 'Fichier invalide : veuillez sélectionner votre modèle au format .onnx (exp.onnx)',
+          ? 'ملف غير صالح: يرجى اختيار ملف النموذج بصيغة .onnx أو .tflite (مثل exp.onnx أو model.tflite)'
+          : 'Fichier invalide : veuillez sélectionner votre modèle au format .onnx ou .tflite',
       });
       return;
     }
 
     try {
+      const formatStr = lower.endsWith('.tflite') || lower.endsWith('.lite') ? 'TFLite' : 'ONNX';
       setInferenceStatus({ 
         type: 'info', 
         message: language === 'ar'
-          ? `جاري تحميل النموذج ${file.name} وتخصيص ذاكرة WebAssembly...`
-          : `Chargement du modèle ${file.name} en WebAssembly...` 
+          ? `جاري تحميل نموذج ${formatStr} (${file.name}) وتخصيص بيئة WebAssembly...`
+          : `Chargement du modèle ${formatStr} (${file.name}) en WebAssembly...` 
       });
-      const meta = await onnxEngine.loadModel(file);
-      setUploadedModelName(meta.name);
+
+      const info = await unifiedModelService.loadModel(file);
+      setUploadedModelName(info.name);
+      setActiveModelFormat(info.format);
       setIsModelLoaded(true);
       setInferenceStatus({
         type: 'success',
         message: language === 'ar'
-          ? `تم تفعيل النموذج الحقيقي ${meta.name} (${(meta.sizeBytes / 1024 / 1024).toFixed(1)} MB) بنجاح! جاري فحص الحقل المجهري...`
-          : `Modèle réel ${meta.name} (${(meta.sizeBytes / 1024 / 1024).toFixed(1)} MB) activé avec succès ! Analyse en cours...`,
+          ? `تم تفعيل نموذج ${info.format.toUpperCase()} (${info.name} - ${(info.sizeBytes / 1024 / 1024).toFixed(1)} MB) بنجاح! جاري فحص الحقل المجهري...`
+          : `Modèle ${info.format.toUpperCase()} (${info.name} - ${(info.sizeBytes / 1024 / 1024).toFixed(1)} MB) activé avec succès ! Analyse en cours...`,
       });
 
       // Automatically execute inference on current slide/image
@@ -321,15 +335,15 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
       setInferenceStatus({
         type: 'error',
         message: language === 'ar'
-          ? `فشل تحميل النموذج ONNX: ${err?.message || 'خطأ داخلي في WebAssembly'}`
-          : `Échec du chargement : ${err?.message || 'Erreur interne WebAssembly'}`,
+          ? `فشل تحميل النموذج: ${err?.message || 'خطأ داخلي في معالجة النموذج'}`
+          : `Échec du chargement : ${err?.message || 'Erreur interne'}`,
       });
     }
   };
 
-  // Run real in-browser ONNX inference on active image or camera frame
+  // Run real in-browser AI inference on active image or camera frame
   const handleRunInferenceWithEngine = async () => {
-    if (!onnxEngine.isReady()) {
+    if (!unifiedModelService.isReady()) {
       setIsOnnxModalOpen(true);
       return;
     }
@@ -352,31 +366,32 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
     }
 
     setIsInferenceRunning(true);
+    const activeFormat = unifiedModelService.getActiveFormat().toUpperCase();
     setInferenceStatus({
       type: 'info',
       message: language === 'ar'
-        ? 'جاري فحص العينة بواسطة النموذج الحقيقي exp.onnx (19 طفيلي)...'
-        : 'Exécution du modèle ONNX réel (19 classes) en WebAssembly...',
+        ? `جاري فحص العينة بواسطة النموذج الحقيقي ${activeFormat} (19 طفيلي)...`
+        : `Exécution du modèle ${activeFormat} réel (19 classes) en WebAssembly...`,
     });
 
     try {
-      const result = await onnxEngine.runInference(targetElement, confidenceThreshold, 0.45);
+      const result = await unifiedModelService.runInference(targetElement, confidenceThreshold, 0.45);
       
       setCustomDetections(result.boxes);
       if (result.boxes.length > 0) {
         setInferenceStatus({
           type: 'success',
           message: language === 'ar'
-            ? `اكتمل الفحص (${result.inferenceTimeMs} ms): تم رصد ${result.boxes.length} عنصر/طفيلي. أعلى نسبة ثقة: ${(result.maxScoreFound * 100).toFixed(1)}%.`
-            : `Inférence ONNX réussie (${result.inferenceTimeMs} ms) : ${result.boxes.length} élément(s) détecté(s). Score max : ${(result.maxScoreFound * 100).toFixed(1)}%.`,
+            ? `اكتمل فحص ${result.formatUsed.toUpperCase()} (${result.inferenceTimeMs} ms): تم رصد ${result.boxes.length} عنصر/طفيلي. أعلى نسبة ثقة: ${(result.maxScoreFound * 100).toFixed(1)}%.`
+            : `Inférence ${result.formatUsed.toUpperCase()} réussie (${result.inferenceTimeMs} ms) : ${result.boxes.length} élément(s) détecté(s). Score max : ${(result.maxScoreFound * 100).toFixed(1)}%.`,
           duration: result.inferenceTimeMs,
         });
       } else {
         setInferenceStatus({
           type: 'warning',
           message: language === 'ar'
-            ? `انتهى فحص exp.onnx (${result.inferenceTimeMs} ms): لم يتم رصد أي طفيليات أعلى من عتبة ${Math.round(confidenceThreshold * 100)}% (أعلى احتمال مسجل في الحقل: ${(result.maxScoreFound * 100).toFixed(1)}%). يمكنك خفض عتبة الدقة لرؤية العناصر الأضعف.`
-            : `Inférence ONNX terminée (${result.inferenceTimeMs} ms) : aucun élément au seuil de ${Math.round(confidenceThreshold * 100)}% (Score max trouvé : ${(result.maxScoreFound * 100).toFixed(1)}%). Baissez le seuil de confiance si nécessaire.`,
+            ? `انتهى فحص ${result.formatUsed.toUpperCase()} (${result.inferenceTimeMs} ms): لم يتم رصد أي طفيليات أعلى من عتبة ${Math.round(confidenceThreshold * 100)}% (أعلى احتمال مسجل في الحقل: ${(result.maxScoreFound * 100).toFixed(1)}%). يمكنك خفض عتبة الدقة لرؤية العناصر الأضعف.`
+            : `Inférence ${result.formatUsed.toUpperCase()} terminée (${result.inferenceTimeMs} ms) : aucun élément au seuil de ${Math.round(confidenceThreshold * 100)}% (Score max trouvé : ${(result.maxScoreFound * 100).toFixed(1)}%). Baissez le seuil de confiance si nécessaire.`,
           duration: result.inferenceTimeMs,
         });
       }
@@ -385,8 +400,8 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
       setInferenceStatus({
         type: 'error',
         message: language === 'ar'
-          ? `خطأ أثناء تنفيذ نموذج ONNX: ${err?.message || 'عدم توافق في أبعاد التنسور'}`
-          : `Erreur d'inférence ONNX : ${err?.message || 'Incompatibilité de tenseur'}`,
+          ? `خطأ أثناء تنفيذ النموذج: ${err?.message || 'عدم توافق في أبعاد التنسور'}`
+          : `Erreur d'inférence : ${err?.message || 'Incompatibilité de tenseur'}`,
       });
     } finally {
       setIsInferenceRunning(false);
@@ -596,17 +611,17 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
             <UploadCloud className="w-3.5 h-3.5" />
             <span>
               {isModelLoaded
-                ? (language === 'ar' ? 'تغيير exp.onnx' : 'Changer exp.onnx')
-                : (language === 'ar' ? '📥 رفع exp.onnx' : '📥 Charger exp.onnx')}
+                ? (language === 'ar' ? `تغيير (${uploadedModelName})` : `Changer (${uploadedModelName})`)
+                : (language === 'ar' ? '📥 رفع ONNX / TFLite' : '📥 Charger ONNX / TFLite')}
             </span>
           </button>
 
-          {/* Hidden File Input for direct ONNX upload */}
+          {/* Hidden File Input for direct ONNX or TFLite upload */}
           <input
             type="file"
             ref={modelFileInputRef}
             onChange={handleModelUpload}
-            accept=".onnx,.pt,.pth"
+            accept=".onnx,.tflite,.lite,.bin,.pt,.pth"
             className="hidden"
           />
 
@@ -669,7 +684,7 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
         </div>
       )}
 
-      {/* Notice Banner when exp.onnx is not yet loaded */}
+      {/* Notice Banner when model is not yet loaded */}
       {!isModelLoaded && (
         <div className="bg-amber-950/90 border-b border-amber-600/60 px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs shrink-0 shadow-inner">
           <div className="flex items-center gap-2.5 text-amber-200">
@@ -677,13 +692,13 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
             <div>
               <span className="font-bold text-amber-300">
                 {language === 'ar' 
-                  ? 'تنبيه سريري: تم إلغاء كافة الكواشف التجريبية والمحاكاة لضمان دقة التحليل.'
-                  : 'Alerte Clinique : Toutes les détections simulées ont été purgées.'}
+                  ? 'التطبيق يدعم نموذجي ONNX (.onnx) و TensorFlow Lite (.tflite)'
+                  : 'Le système prend en charge les modèles ONNX (.onnx) et TensorFlow Lite (.tflite)'}
               </span>
               <span className="block text-[11px] text-amber-200/80 mt-0.5">
                 {language === 'ar'
-                  ? 'يرجى رفع ملف النموذج الحقيقي (exp.onnx) لتشغيل الكاشف بدقة على الـ 19 فئة طفيلية.'
-                  : 'Veuillez charger votre modèle réel (exp.onnx) pour lancer la détection sur les 19 classes.'}
+                  ? 'يمكنك رفع ملف exp.onnx أو model.tflite لتشغيل الكاشف الحقيقي مباشرة على الـ 19 فئة طفيلية.'
+                  : 'Chargez votre fichier exp.onnx ou model.tflite pour lancer la détection sur les 19 classes.'}
               </span>
             </div>
           </div>
@@ -693,13 +708,13 @@ export const AnalysisWorkspace: React.FC<AnalysisWorkspaceProps> = ({
               className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg shadow-md flex items-center gap-2 cursor-pointer transition-transform active:scale-95 text-xs"
             >
               <UploadCloud className="w-4 h-4 text-slate-950" />
-              <span>{language === 'ar' ? '📥 رفع ملف exp.onnx الآن' : '📥 Charger exp.onnx'}</span>
+              <span>{language === 'ar' ? '📥 رفع exp.onnx أو model.tflite' : '📥 Charger ONNX / TFLite'}</span>
             </button>
             <button
               onClick={() => setIsOnnxModalOpen(true)}
               className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 rounded-lg border border-amber-700/50 text-xs cursor-pointer"
             >
-              {language === 'ar' ? 'فحص التنسور' : 'Diagnostic'}
+              {language === 'ar' ? 'إدارة النماذج' : 'Gestionnaire'}
             </button>
           </div>
         </div>
